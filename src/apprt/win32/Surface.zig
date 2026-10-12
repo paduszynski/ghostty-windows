@@ -2078,6 +2078,13 @@ pub fn handleDpiChange(self: *Surface) void {
 
     // Notify the scrollbar of the new DPI.
     if (self.scrollbar) |sb| sb.onDpiChanged(@intFromFloat(self.scale * 96.0));
+
+    // Rescale the terminal itself (font size, grid).
+    if (self.core_surface_ready) {
+        self.core_surface.contentScaleCallback(.{ .x = self.scale, .y = self.scale }) catch |err| {
+            log.err("contentScaleCallback error: {}", .{err});
+        };
+    }
 }
 
 /// Handle WM_KEYDOWN / WM_SYSKEYDOWN / WM_KEYUP / WM_SYSKEYUP.

@@ -11,6 +11,7 @@ const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
+const input = @import("../../input.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -45,8 +46,9 @@ scale: f32 = 1.0,
 /// stack garbage.
 tab_rects: [64]w32.RECT = std.mem.zeroes([64]w32.RECT),
 
-/// Hit-test rectangle for the "+" (new tab) button.
-new_tab_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+/// Hit-test rectangles for the tab bar buttons, filled by layoutTabBar.
+/// Caption buttons are zero-sized unless the tab bar is the title bar.
+title_button_rects: std.EnumArray(TitleButton, w32.RECT) = .initFill(.{ .left = 0, .top = 0, .right = 0, .bottom = 0 }),
 
 /// Index of the tab currently being hovered (-1 = none).
 hover_tab: isize = -1,
@@ -54,8 +56,21 @@ hover_tab: isize = -1,
 /// Whether the close button on the hovered tab is being hovered.
 hover_close: bool = false,
 
-/// Whether the "+" (new tab) button is being hovered.
-hover_new_tab: bool = false,
+/// The tab bar button under the mouse.
+hover_button: TitleButton = .none,
+
+/// Caption button (minimize/maximize/close) pressed and not yet released.
+pressed_button: TitleButton = .none,
+
+/// Whether WM_NCMOUSELEAVE tracking is active for the caption buttons.
+tracking_nc_mouse: bool = false,
+
+/// Whether the window is active, for dimming the caption button glyphs.
+window_active: bool = true,
+
+/// Icon fonts (Segoe Fluent Icons) for the caption and toolbar buttons.
+caption_icon_font: ?*anyopaque = null,
+toolbar_icon_font: ?*anyopaque = null,
 
 /// Tab drag state: which tab is being dragged (-1 = none).
 drag_tab: isize = -1,
@@ -126,6 +141,38 @@ resize_overlay_hwnd: ?w32.HWND = null,
 /// True once the initial WM_SIZE has been seen; resize-overlay =
 /// after-first suppresses the overlay for that first layout pass.
 resize_seen_first: bool = false,
+
+/// Buttons drawn in the tab bar besides the tabs. The last three are the
+/// window caption buttons, shown when the tab bar is the title bar.
+pub const TitleButton = enum {
+    none,
+    new_tab,
+    new_tab_menu,
+    tab_list,
+    main_menu,
+    minimize,
+    maximize,
+    close,
+
+    fn isCaption(self: TitleButton) bool {
+        return switch (self) {
+            .minimize, .maximize, .close => true,
+            else => false,
+        };
+    }
+
+    fn fromHitTest(hit: usize) TitleButton {
+        return switch (@as(isize, @bitCast(hit))) {
+            w32.HTMINBUTTON => .minimize,
+            w32.HTMAXBUTTON => .maximize,
+            w32.HTCLOSE => .close,
+            else => .none,
+        };
+    }
+};
+
+/// Tab bar height at 96 DPI.
+const TAB_BAR_HEIGHT: f32 = 36.0;
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
@@ -337,6 +384,24 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     }
 
+    self.createFonts();
+
+    // WM_NCCALCSIZE ran during CreateWindowExW, before GWLP_USERDATA was
+    // set, so recompute the frame now that windowWndProc can remove the
+    // system caption.
+    _ = w32.SetWindowPos(hwnd, null, 0, 0, 0, 0, w32.SWP_NOZORDER | w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_FRAMECHANGED);
+    self.tab_bar_visible = self.integratedTitlebar();
+
+    // Don't show the window yet — addTab() will show the child
+    // surface which triggers ShowWindow on the parent as needed.
+    // Showing the parent before the terminal is ready can cause
+    // timing issues with ConPTY.
+}
+
+/// Create the tab bar fonts for the current DPI scale.
+fn createFonts(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+
     // Create the tab bar font (Segoe UI, 12px at 96 DPI, scaled).
     const font_height: i32 = -@as(i32, @intFromFloat(16.0 * self.scale));
     self.tab_font = w32.CreateFontW(
@@ -355,11 +420,82 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         0, // iPitchAndFamily
         std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
     );
+    self.caption_icon_font = createIconFont(hwnd, 10.0 * self.scale);
+    self.toolbar_icon_font = createIconFont(hwnd, 14.0 * self.scale);
+}
 
-    // Don't show the window yet — addTab() will show the child
-    // surface which triggers ShowWindow on the parent as needed.
-    // Showing the parent before the terminal is ready can cause
-    // timing issues with ConPTY.
+/// WM_DPICHANGED: rescale the tab bar, take the window rect Windows
+/// suggests for the new DPI, and pass the change on to every surface.
+/// With per-monitor v2 awareness only top-level windows get the message.
+fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
+    const hwnd = self.hwnd orelse return;
+    self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
+    self.deleteFonts();
+    self.createFonts();
+    _ = w32.SetWindowPos(
+        hwnd,
+        null,
+        suggested.left,
+        suggested.top,
+        suggested.right - suggested.left,
+        suggested.bottom - suggested.top,
+        w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
+    );
+    for (0..self.tab_count) |i| {
+        var it = self.tab_trees[i].iterator();
+        while (it.next()) |entry| entry.view.handleDpiChange();
+    }
+    self.handleResize();
+}
+
+/// Window size (including the frame) for a terminal area of the given
+/// size, for initial_size and reset_window_size.
+pub fn windowSizeForSurface(self: *const Window, width: u32, height: u32) struct { width: i32, height: i32 } {
+    const hwnd = self.hwnd orelse return .{ .width = @intCast(width), .height = @intCast(height) };
+    var rect = w32.RECT{
+        .left = 0,
+        .top = 0,
+        .right = @intCast(width),
+        .bottom = @as(i32, @intCast(height)) + self.tabBarHeight(),
+    };
+    _ = w32.AdjustWindowRectExForDpi(
+        &rect,
+        w32.GetWindowLongW(hwnd, w32.GWL_STYLE),
+        0,
+        w32.GetWindowLongW(hwnd, w32.GWL_EXSTYLE),
+        w32.GetDpiForWindow(hwnd),
+    );
+    // The integrated title bar replaces the caption and top border; only
+    // the side and bottom borders are non-client.
+    if (self.integratedTitlebar()) rect.top = 0;
+    return .{ .width = rect.right - rect.left, .height = rect.bottom - rect.top };
+}
+
+/// A maximized window whose client area covers its whole monitor looks
+/// fullscreen to the shell, which then won't reveal an auto-hide taskbar.
+/// Leave a little of the edge that taskbar hides on uncovered.
+fn insetForAutoHideTaskbar(hwnd: w32.HWND, rect: *w32.RECT) void {
+    const monitor = w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST);
+    var mi: w32.MONITORINFO = undefined;
+    mi.cbSize = @sizeOf(w32.MONITORINFO);
+    if (w32.GetMonitorInfoW(monitor, &mi) == 0) return;
+    for ([_]u32{ w32.ABE_LEFT, w32.ABE_TOP, w32.ABE_RIGHT, w32.ABE_BOTTOM }) |edge| {
+        var abd = w32.APPBARDATA{
+            .cbSize = @sizeOf(w32.APPBARDATA),
+            .hWnd = null,
+            .uCallbackMessage = 0,
+            .uEdge = edge,
+            .rc = mi.rcMonitor,
+            .lParam = 0,
+        };
+        if (w32.SHAppBarMessage(w32.ABM_GETAUTOHIDEBAREX, &abd) == 0) continue;
+        switch (edge) {
+            w32.ABE_LEFT => rect.left += 2,
+            w32.ABE_TOP => rect.top += 2,
+            w32.ABE_RIGHT => rect.right -= 2,
+            else => rect.bottom -= 2,
+        }
+    }
 }
 
 /// Deinitialize the Window: close all tabs, delete font, destroy HWND.
@@ -367,11 +503,7 @@ pub fn deinit(self: *Window) void {
     // Close all tab surfaces.
     self.cleanupAllSurfaces();
 
-    // Delete the tab bar font.
-    if (self.tab_font) |font| {
-        _ = w32.DeleteObject(font);
-        self.tab_font = null;
-    }
+    self.deleteFonts();
 
     // Clear GWLP_USERDATA before destroying to prevent stale pointer access.
     if (self.hwnd) |hwnd| {
@@ -381,11 +513,62 @@ pub fn deinit(self: *Window) void {
     }
 }
 
+fn deleteFonts(self: *Window) void {
+    inline for (.{ "tab_font", "caption_icon_font", "toolbar_icon_font" }) |field| {
+        if (@field(self, field)) |font| {
+            _ = w32.DeleteObject(font);
+            @field(self, field) = null;
+        }
+    }
+}
+
+/// Create a font for icon glyphs: Segoe Fluent Icons (Windows 11), or
+/// Segoe MDL2 Assets on Windows 10, which has the same code points for
+/// the glyphs we use.
+fn createIconFont(hwnd: w32.HWND, px: f32) ?*anyopaque {
+    const height: i32 = -@as(i32, @intFromFloat(@round(px)));
+    const faces = [_][:0]const u16{
+        std.unicode.utf8ToUtf16LeStringLiteral("Segoe Fluent Icons"),
+        std.unicode.utf8ToUtf16LeStringLiteral("Segoe MDL2 Assets"),
+    };
+    for (faces) |face| {
+        const font = w32.CreateFontW(height, 0, 0, 0, w32.FW_NORMAL, 0, 0, 0, w32.DEFAULT_CHARSET, 0, 0, 0, 0, face) orelse continue;
+
+        // GDI silently substitutes a missing face, so check what we got.
+        const hdc = w32.GetDC(hwnd) orelse return font;
+        defer _ = w32.ReleaseDC(hwnd, hdc);
+        const old = w32.SelectObject(hdc, font);
+        var name: [32]u16 = undefined;
+        const len = w32.GetTextFaceW(hdc, name.len, &name);
+        _ = w32.SelectObject(hdc, old);
+        if (len > 0 and std.mem.eql(u16, std.mem.sliceTo(name[0..@intCast(len)], 0), face)) return font;
+        _ = w32.DeleteObject(font);
+    }
+    return null;
+}
+
+/// Whether the tab bar doubles as the title bar: the system caption is
+/// removed (WM_NCCALCSIZE) and the tab bar draws the window buttons.
+pub fn integratedTitlebar(self: *const Window) bool {
+    if (self.is_quick_terminal or self.is_fullscreen) return false;
+    const hwnd = self.hwnd orelse return false;
+    return (w32.GetWindowLongW(hwnd, w32.GWL_STYLE) & w32.WS_CAPTION) == w32.WS_CAPTION;
+}
+
+/// Height of the top resize band, which lies inside our client area
+/// once the system caption is removed.
+fn resizeBorderHeight(self: *const Window) i32 {
+    const hwnd = self.hwnd orelse return 0;
+    const dpi = w32.GetDpiForWindow(hwnd);
+    return w32.GetSystemMetricsForDpi(w32.SM_CYFRAME, dpi) +
+        w32.GetSystemMetricsForDpi(w32.SM_CXPADDEDBORDER, dpi);
+}
+
 /// Returns the tab bar height in pixels, accounting for DPI scale.
 /// Returns 0 if the tab bar is not visible.
 pub fn tabBarHeight(self: *const Window) i32 {
     if (!self.tab_bar_visible) return 0;
-    return @intFromFloat(@round(32.0 * self.scale));
+    return @intFromFloat(@round(TAB_BAR_HEIGHT * self.scale));
 }
 
 /// Returns the client rect available for the active surface, which is
@@ -1176,7 +1359,8 @@ fn updateTabBarVisibility(self: *Window) void {
         return;
     }
     const show_config = self.app.config.@"window-show-tab-bar";
-    const should_show = switch (show_config) {
+    // As the title bar the tab bar can't hide: it holds the window buttons.
+    const should_show = self.integratedTitlebar() or switch (show_config) {
         .always => true,
         .auto => self.tab_count > 1,
         .never => false,
@@ -1190,6 +1374,8 @@ fn updateTabBarVisibility(self: *Window) void {
 /// Invalidate the tab bar region so it gets repainted.
 pub fn invalidateTabBar(self: *Window) void {
     const hwnd = self.hwnd orelse return;
+    // Hit testing reads the layout, and WM_PAINT may be a while coming.
+    self.layoutTabBar();
     var rect = w32.RECT{
         .left = 0,
         .top = 0,
@@ -1199,22 +1385,24 @@ pub fn invalidateTabBar(self: *Window) void {
     _ = w32.InvalidateRect(hwnd, &rect, 0);
 }
 
-/// Populate equal-width tab rectangles and return their rightmost edge.
+/// Populate equal-width tab rectangles starting at `left` and return
+/// their rightmost edge.
 fn layoutTabRects(
     rects: []w32.RECT,
+    left: i32,
     available_w: i32,
     bar_h: i32,
     min_tab_w: i32,
     max_tab_w: i32,
 ) i32 {
     const tab_count: i32 = @intCast(rects.len);
-    if (tab_count == 0) return 0;
+    if (tab_count == 0) return left;
 
     var tab_w = @divTrunc(available_w, tab_count);
     tab_w = @max(tab_w, min_tab_w);
     tab_w = @min(tab_w, max_tab_w);
 
-    var x: i32 = 0;
+    var x: i32 = left;
     for (rects) |*rect| {
         rect.* = .{
             .left = x,
@@ -1231,7 +1419,7 @@ fn layoutTabRects(
 test "tab bar keeps tab widths equal" {
     var rects: [2]w32.RECT = undefined;
 
-    const tabs_right = layoutTabRects(&rects, 964, 30, 60, 200);
+    const tabs_right = layoutTabRects(&rects, 0, 964, 30, 60, 200);
 
     try std.testing.expectEqual(@as(i32, 400), tabs_right);
     try std.testing.expectEqual(@as(i32, 200), rects[0].right - rects[0].left);
@@ -1239,8 +1427,149 @@ test "tab bar keeps tab widths equal" {
     try std.testing.expectEqual(rects[0].right, rects[1].left);
 }
 
+test "tab bar tabs start at the left offset" {
+    var rects: [2]w32.RECT = undefined;
+
+    const tabs_right = layoutTabRects(&rects, 64, 300, 30, 60, 200);
+
+    try std.testing.expectEqual(@as(i32, 64), rects[0].left);
+    try std.testing.expectEqual(@as(i32, 364), tabs_right);
+}
+
+/// Lay out the tab bar: the new-tab split button on the left, then the
+/// tabs, then the tab list and main menu buttons and, as the title bar,
+/// the caption buttons on the right. Fills tab_rects and
+/// title_button_rects for painting and hit testing.
+fn layoutTabBar(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client) == 0) return;
+    const client_w = client.right - client.left;
+    const bar_h = self.tabBarHeight();
+    const scaled = struct {
+        fn f(s: f32, v: f32) i32 {
+            return @intFromFloat(@round(v * s));
+        }
+    }.f;
+    const button_w = scaled(self.scale, 40.0);
+    const chevron_w = scaled(self.scale, 24.0);
+    const caption_w = scaled(self.scale, 46.0);
+
+    const zero: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    self.title_button_rects = .initFill(zero);
+    const rects = &self.title_button_rects;
+
+    // Left: new tab, with its dropdown.
+    rects.set(.new_tab, .{ .left = 0, .top = 0, .right = button_w, .bottom = bar_h });
+    rects.set(.new_tab_menu, .{ .left = button_w, .top = 0, .right = button_w + chevron_w, .bottom = bar_h });
+    const tabs_left = button_w + chevron_w + scaled(self.scale, 4.0);
+
+    // Right, from the edge inwards.
+    var right = client_w;
+    const integrated = self.integratedTitlebar();
+    if (integrated) {
+        inline for (.{ TitleButton.close, TitleButton.maximize, TitleButton.minimize }) |b| {
+            rects.set(b, .{ .left = right - caption_w, .top = 0, .right = right, .bottom = bar_h });
+            right -= caption_w;
+        }
+    }
+    inline for (.{ TitleButton.main_menu, TitleButton.tab_list }) |b| {
+        rects.set(b, .{ .left = right - button_w, .top = 0, .right = right, .bottom = bar_h });
+        right -= button_w;
+    }
+
+    // Keep some empty caption to grab the window by, however many tabs.
+    const drag_w = if (integrated) scaled(self.scale, 48.0) else 0;
+    const available_w = @max(right - drag_w - tabs_left, 0);
+    _ = layoutTabRects(
+        self.tab_rects[0..self.tab_count],
+        tabs_left,
+        available_w,
+        bar_h,
+        scaled(self.scale, 60.0),
+        scaled(self.scale, 200.0),
+    );
+
+    // With too many tabs to fit at the minimum width the last ones would
+    // run under the buttons; clip them so they stay out of the way.
+    for (self.tab_rects[0..self.tab_count]) |*r| {
+        r.right = @min(r.right, right);
+        r.left = @min(r.left, r.right);
+    }
+}
+
+/// The tab bar button at client point (x, y), if any.
+fn titleButtonAt(self: *const Window, x: i32, y: i32) TitleButton {
+    for (std.enums.values(TitleButton)) |button| {
+        const r = self.title_button_rects.get(button);
+        if (x >= r.left and x < r.right and y >= r.top and y < r.bottom) return button;
+    }
+    return .none;
+}
+
+/// Index of the tab at client x, if any.
+fn tabAt(self: *const Window, x: i32) ?usize {
+    for (self.tab_rects[0..self.tab_count], 0..) |r, i| {
+        if (x >= r.left and x < r.right) return i;
+    }
+    return null;
+}
+
+/// WM_NCHITTEST for a client point while the tab bar is the title bar:
+/// empty bar space is the caption (so Windows runs the move loop, which
+/// FancyZones and Aero Snap need), the maximize button reports
+/// HTMAXBUTTON (for the Snap Layouts flyout), and the top edge resizes.
+fn hitTestTitlebar(self: *const Window, x: i32, y: i32) isize {
+    if (y >= self.tabBarHeight()) return w32.HTCLIENT;
+
+    const hwnd = self.hwnd orelse return w32.HTCLIENT;
+    if (w32.IsZoomed(hwnd) == 0) {
+        const border = self.resizeBorderHeight();
+        if (y < border) {
+            var client: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &client) != 0) {
+                if (x < border) return w32.HTTOPLEFT;
+                if (x >= client.right - border) return w32.HTTOPRIGHT;
+            }
+            return w32.HTTOP;
+        }
+    }
+
+    return switch (self.titleButtonAt(x, y)) {
+        .minimize => w32.HTMINBUTTON,
+        .maximize => w32.HTMAXBUTTON,
+        .close => w32.HTCLOSE,
+        .none => if (self.tabAt(x) != null) w32.HTCLIENT else w32.HTCAPTION,
+        else => w32.HTCLIENT,
+    };
+}
+
+/// Run a caption button's action.
+fn activateCaptionButton(self: *Window, button: TitleButton) void {
+    const hwnd = self.hwnd orelse return;
+    switch (button) {
+        .minimize => _ = w32.SendMessageW(hwnd, w32.WM_SYSCOMMAND, w32.SC_MINIMIZE, 0),
+        .maximize => _ = w32.SendMessageW(
+            hwnd,
+            w32.WM_SYSCOMMAND,
+            if (w32.IsZoomed(hwnd) != 0) w32.SC_RESTORE else w32.SC_MAXIMIZE,
+            0,
+        ),
+        .close => _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0),
+        else => {},
+    }
+}
+
+fn setHoverButton(self: *Window, button: TitleButton) void {
+    if (button == self.hover_button) return;
+    self.hover_button = button;
+    self.invalidateTabBar();
+}
+
 /// Paint the tab bar using double-buffered GDI painting.
-/// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
+/// Draws the new-tab split button, tab backgrounds, labels and close
+/// buttons (x), the tab list and menu buttons and, as the title bar,
+/// the caption buttons.
 fn paintTabBar(self: *Window) void {
     const hwnd = self.hwnd orelse return;
 
@@ -1285,6 +1614,13 @@ fn paintTabBar(self: *Window) void {
     const hover_b: u8 = @min(@as(u16, bar_b) + 15, 255);
     const hover_color = w32.RGB(hover_r, hover_g, hover_b);
 
+    // Pressed background: a step past hover.
+    const pressed_color = w32.RGB(
+        @min(@as(u16, hover_r) + 10, 255),
+        @min(@as(u16, hover_g) + 10, 255),
+        @min(@as(u16, hover_b) + 10, 255),
+    );
+
     // Active tab background: terminal bg (darker than bar).
     const active_bg_color = w32.RGB(bg.r, bg.g, bg.b);
 
@@ -1299,11 +1635,26 @@ fn paintTabBar(self: *Window) void {
     const close_normal_color = w32.RGB(150, 150, 150);
     const close_hover_color = w32.RGB(232, 65, 65);
 
+    // Windows 11 caption close button.
+    const caption_close_hover = w32.RGB(196, 43, 28);
+    const caption_close_pressed = w32.RGB(200, 60, 49);
+
+    // Button glyphs dim with the window, like the system caption.
+    const glyph_color = if (self.window_active) active_text_color else inactive_text_color;
+
+    const fill = struct {
+        fn f(dc: w32.HDC, rect: w32.RECT, color: u32) void {
+            var r = rect;
+            // CreateSolidBrush failures are rare (GDI handle exhaustion),
+            // and skipping one fill is better than skipping the frame.
+            const brush = w32.CreateSolidBrush(color) orelse return;
+            _ = w32.FillRect(dc, &r, brush);
+            _ = w32.DeleteObject(@ptrCast(brush));
+        }
+    }.f;
+
     // --- Fill bar background ---
-    var bar_rect = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = bar_h };
-    const bar_brush = w32.CreateSolidBrush(bar_color) orelse return;
-    _ = w32.FillRect(mem_dc, &bar_rect, bar_brush);
-    _ = w32.DeleteObject(@ptrCast(bar_brush));
+    fill(mem_dc, .{ .left = 0, .top = 0, .right = client_w, .bottom = bar_h }, bar_color);
 
     // --- Select font and set text mode ---
     var old_font: ?*anyopaque = null;
@@ -1316,25 +1667,11 @@ fn paintTabBar(self: *Window) void {
     _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
 
     // --- Calculate tab geometry ---
-    const new_tab_btn_w: i32 = @intFromFloat(@round(36.0 * self.scale));
     const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
     const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
     const accent_h: i32 = @intFromFloat(@round(2.0 * self.scale));
 
-    const available_w = client_w - new_tab_btn_w;
-
-    // Calculate equal tab widths within the configured bounds. Any width left
-    // after the maximum is reached remains empty instead of stretching the
-    // final tab.
-    const min_tab_w: i32 = @intFromFloat(@round(60.0 * self.scale));
-    const max_tab_w: i32 = @intFromFloat(@round(200.0 * self.scale));
-    const tabs_right = layoutTabRects(
-        self.tab_rects[0..self.tab_count],
-        available_w,
-        bar_h,
-        min_tab_w,
-        max_tab_w,
-    );
+    self.layoutTabBar();
 
     // --- Draw each tab ---
     for (0..self.tab_count) |i| {
@@ -1342,33 +1679,21 @@ fn paintTabBar(self: *Window) void {
         const is_hovered = (@as(isize, @intCast(i)) == self.hover_tab);
         const x = self.tab_rects[i].left;
         const this_tab_w = self.tab_rects[i].right - x;
+        if (this_tab_w <= 0) continue;
 
-        // Draw tab background. CreateSolidBrush failures are rare (GDI
-        // handle exhaustion), but should not skip the rest of the tab.
+        // Draw tab background.
         if (is_active) {
-            var tab_rect = w32.RECT{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h };
-            if (w32.CreateSolidBrush(active_bg_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &tab_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
+            fill(mem_dc, .{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h }, active_bg_color);
 
             // Draw accent line at bottom.
-            var accent_rect = w32.RECT{
+            fill(mem_dc, .{
                 .left = x,
                 .top = bar_h - accent_h,
                 .right = x + this_tab_w,
                 .bottom = bar_h,
-            };
-            if (w32.CreateSolidBrush(accent_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &accent_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
+            }, accent_color);
         } else if (is_hovered) {
-            var hover_rect = w32.RECT{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h };
-            if (w32.CreateSolidBrush(hover_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &hover_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
+            fill(mem_dc, .{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h }, hover_color);
         }
 
         // Draw tab title text.
@@ -1417,41 +1742,47 @@ fn paintTabBar(self: *Window) void {
         }
     }
 
-    // --- Draw new-tab (+) button ---
-    {
-        const btn_left = tabs_right;
-        const btn_right = btn_left + new_tab_btn_w;
-        self.new_tab_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
+    // --- Draw the buttons ---
+    const maximized = w32.IsZoomed(hwnd) != 0;
+    for (std.enums.values(TitleButton)) |button| {
+        const rect = self.title_button_rects.get(button);
+        if (button == .none or rect.right <= rect.left) continue;
 
-        // Hover highlight for new-tab button.
-        if (self.hover_new_tab) {
-            var btn_rect = w32.RECT{ .left = btn_left, .top = 0, .right = btn_right, .bottom = bar_h };
-            const nt_brush = w32.CreateSolidBrush(hover_color);
-            if (nt_brush) |brush| {
-                _ = w32.FillRect(mem_dc, &btn_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
+        const hovered = button == self.hover_button;
+        const pressed = hovered and button == self.pressed_button;
+        if (button == .close) {
+            if (hovered) fill(mem_dc, rect, if (pressed) caption_close_pressed else caption_close_hover);
+        } else if (hovered) {
+            fill(mem_dc, rect, if (pressed) pressed_color else hover_color);
         }
 
-        _ = w32.SetTextColor(mem_dc, inactive_text_color);
-        const plus_char = std.unicode.utf8ToUtf16LeStringLiteral("+");
-        var plus_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
+        // Segoe Fluent Icons code points.
+        const glyph: u16 = switch (button) {
+            .none => unreachable,
+            .new_tab => 0xE710, // Add
+            .new_tab_menu => 0xE70D, // ChevronDown
+            .tab_list => 0xE8A9, // ViewAll
+            .main_menu => 0xE700, // GlobalNavigationButton
+            .minimize => 0xE921, // ChromeMinimize
+            .maximize => if (maximized) 0xE923 else 0xE922, // ChromeRestore / ChromeMaximize
+            .close => 0xE8BB, // ChromeClose
         };
+        const font = switch (button) {
+            .new_tab, .tab_list, .main_menu => self.toolbar_icon_font,
+            else => self.caption_icon_font,
+        } orelse continue;
+
+        const prev_font = w32.SelectObject(mem_dc, font);
+        defer _ = w32.SelectObject(mem_dc, prev_font);
+        _ = w32.SetTextColor(mem_dc, if (button == .close and hovered) w32.RGB(255, 255, 255) else glyph_color);
+        var glyph_rect = rect;
+        const text = [_:0]u16{glyph};
         _ = w32.DrawTextW(
             mem_dc,
-            plus_char,
+            &text,
             1,
-            &plus_rect,
-            w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+            &glyph_rect,
+            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
         );
     }
 
@@ -1463,7 +1794,11 @@ fn paintTabBar(self: *Window) void {
 /// Saves/restores window style and placement.
 pub fn toggleFullscreen(self: *Window) void {
     const hwnd = self.hwnd orelse return;
-    if (!self.is_fullscreen) {
+    // Flip the flag first: the SWP_FRAMECHANGED below runs WM_NCCALCSIZE,
+    // which must already see the new state to add or remove the caption.
+    self.is_fullscreen = !self.is_fullscreen;
+    defer self.updateTabBarVisibility();
+    if (self.is_fullscreen) {
         self.saved_style = w32.GetWindowLongW(hwnd, w32.GWL_STYLE);
         _ = w32.GetWindowRect(hwnd, &self.saved_rect);
         _ = w32.SetWindowLongW(hwnd, w32.GWL_STYLE, w32.WS_POPUP | w32.WS_VISIBLE_STYLE);
@@ -1477,7 +1812,6 @@ pub fn toggleFullscreen(self: *Window) void {
         _ = w32.SetWindowLongW(hwnd, w32.GWL_STYLE, self.saved_style);
         _ = w32.SetWindowPos(hwnd, null, self.saved_rect.left, self.saved_rect.top, self.saved_rect.right - self.saved_rect.left, self.saved_rect.bottom - self.saved_rect.top, w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED);
     }
-    self.is_fullscreen = !self.is_fullscreen;
 }
 
 /// Toggle window decorations (title bar + borders) on/off.
@@ -1497,6 +1831,8 @@ pub fn toggleWindowDecorations(self: *Window) void {
     }
     // Force frame recalculation.
     _ = w32.SetWindowPos(hwnd, null, 0, 0, 0, 0, w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED | w32.SWP_NOMOVE | w32.SWP_NOSIZE);
+    self.updateTabBarVisibility();
+    self.invalidateTabBar();
 }
 
 /// Handle WM_SIZE: re-layout the active tab's split panes and repaint tab bar.
@@ -1599,13 +1935,19 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
     if (!self.tab_bar_visible) return;
     if (y >= self.tabBarHeight()) return;
 
-    // Check new-tab button.
-    if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
-        _ = self.addTab() catch |err| {
-            log.err("failed to create new tab: {}", .{err});
+    switch (self.titleButtonAt(x, y)) {
+        .none => {},
+        .new_tab => {
+            _ = self.addTab() catch |err| {
+                log.err("failed to create new tab: {}", .{err});
+            };
             return;
-        };
-        return;
+        },
+        .new_tab_menu => return self.showNewTabMenu(),
+        .tab_list => return self.showTabListMenu(),
+        .main_menu => return self.showMainMenu(),
+        // Caption buttons are non-client (WM_NCHITTEST) and handled there.
+        .minimize, .maximize, .close => return,
     }
 
     // Check each tab.
@@ -1696,13 +2038,11 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
 
     var new_hover: isize = -1;
     var new_close = false;
-    var new_new_tab = false;
+    var new_button: TitleButton = .none;
 
     if (y < self.tabBarHeight()) {
-        // Check new-tab button.
-        if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
-            new_new_tab = true;
-        } else {
+        new_button = self.titleButtonAt(x, y);
+        if (new_button == .none) {
             // Check tabs.
             const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
             const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
@@ -1718,10 +2058,10 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
         }
     }
 
-    if (new_hover != self.hover_tab or new_close != self.hover_close or new_new_tab != self.hover_new_tab) {
+    if (new_hover != self.hover_tab or new_close != self.hover_close or new_button != self.hover_button) {
         self.hover_tab = new_hover;
         self.hover_close = new_close;
-        self.hover_new_tab = new_new_tab;
+        self.hover_button = new_button;
         self.invalidateTabBar();
     }
 }
@@ -1808,13 +2148,213 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
     }
 }
 
+/// An entry in one of the tab bar menus.
+const MenuItem = union(enum) {
+    separator,
+    action: struct { label: [:0]const u16, action: input.Binding.Action },
+    submenu: struct { label: [:0]const u16, items: []const MenuItem },
+
+    fn item(comptime label: []const u8, action: input.Binding.Action) MenuItem {
+        return .{ .action = .{ .label = std.unicode.utf8ToUtf16LeStringLiteral(label), .action = action } };
+    }
+};
+
+/// The new-tab dropdown, as in GTK's new-tab split button.
+const new_tab_menu_items = items: {
+    @setEvalBranchQuota(20_000);
+    break :items [_]MenuItem{
+        .item("New Window", .new_window),
+        .separator,
+        .item("Split Right", .{ .new_split = .right }),
+        .item("Split Down", .{ .new_split = .down }),
+        .item("Split Left", .{ .new_split = .left }),
+        .item("Split Up", .{ .new_split = .up }),
+    };
+};
+
+/// The main (☰) menu, following GTK's.
+const main_menu_items = items: {
+    @setEvalBranchQuota(20_000);
+    break :items [_]MenuItem{
+        .item("Copy", .{ .copy_to_clipboard = .mixed }),
+        .item("Paste", .paste_from_clipboard),
+        .separator,
+        .item("New Window", .new_window),
+        .item("Close Window", .close_window),
+        .separator,
+        .item("New Tab", .new_tab),
+        .item("Close Tab", .{ .close_tab = .this }),
+        .item("Change Tab Title...", .prompt_tab_title),
+        .separator,
+        .{ .submenu = .{
+            .label = std.unicode.utf8ToUtf16LeStringLiteral("Split"),
+            .items = &.{
+                .item("Split Right", .{ .new_split = .right }),
+                .item("Split Down", .{ .new_split = .down }),
+                .item("Split Left", .{ .new_split = .left }),
+                .item("Split Up", .{ .new_split = .up }),
+            },
+        } },
+        .separator,
+        .item("Clear", .clear_screen),
+        .item("Reset", .reset),
+        .separator,
+        .item("Command Palette", .toggle_command_palette),
+        .item("Open Configuration", .{ .open_config = .default }),
+        .item("Reload Configuration", .reload_config),
+        .separator,
+        .item("Quit", .quit),
+    };
+};
+
+/// Command ids for menu items; an item's id is this plus its index in
+/// the flattened item list (or the tab index, for the tab list).
+const MENU_ID_BASE: usize = 9100;
+
+/// Append `items` to `menu`, numbering actions from `next_id`.
+fn appendMenuItems(menu: w32.HMENU, comptime items: []const MenuItem, next_id: *usize) void {
+    inline for (items) |entry| switch (entry) {
+        .separator => _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null),
+        .action => |a| {
+            _ = w32.AppendMenuW(menu, w32.MF_STRING, next_id.*, a.label);
+            next_id.* += 1;
+        },
+        .submenu => |sub| {
+            if (w32.CreatePopupMenu()) |submenu| {
+                appendMenuItems(submenu, sub.items, next_id);
+                // The parent menu owns and destroys the submenu.
+                _ = w32.AppendMenuW(menu, w32.MF_POPUP, @intFromPtr(submenu), sub.label);
+            }
+        },
+    };
+}
+
+/// The action for command `id` from a menu built by appendMenuItems.
+fn menuItemAction(comptime items: []const MenuItem, id: usize, next_id: *usize) ?input.Binding.Action {
+    inline for (items) |entry| switch (entry) {
+        .separator => {},
+        .action => |a| {
+            if (id == next_id.*) return a.action;
+            next_id.* += 1;
+        },
+        .submenu => |sub| if (menuItemAction(sub.items, id, next_id)) |action| return action,
+    };
+    return null;
+}
+
+/// Show `items` as a menu dropping down from `button` and run the
+/// chosen action.
+fn showActionMenu(self: *Window, comptime items: []const MenuItem, button: TitleButton) void {
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+    var next_id: usize = MENU_ID_BASE;
+    appendMenuItems(menu, items, &next_id);
+
+    const cmd = self.trackButtonMenu(menu, button);
+    if (cmd <= 0) return;
+    var id: usize = MENU_ID_BASE;
+    const action = menuItemAction(items, @intCast(cmd), &id) orelse return;
+    self.performMenuAction(action);
+}
+
+fn showNewTabMenu(self: *Window) void {
+    self.showActionMenu(&new_tab_menu_items, .new_tab_menu);
+}
+
+fn showMainMenu(self: *Window) void {
+    self.showActionMenu(&main_menu_items, .main_menu);
+}
+
+/// The tab overview button: a menu of the tabs by title, the active one
+/// checked; choosing one switches to it.
+fn showTabListMenu(self: *Window) void {
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+
+    // Tabs can close while the menu is open, so remember each entry by
+    // its surface rather than by index.
+    var surfaces: [MAX_TABS]*Surface = undefined;
+    const count = self.tab_count;
+    @memcpy(surfaces[0..count], self.tab_active_surface[0..count]);
+
+    for (0..count) |i| {
+        // Room for a title with every character an escaped '&'.
+        var label: [2 * 256 + 1]u16 = undefined;
+        var len: usize = 0;
+        for (self.tab_titles[i][0..self.tab_title_lens[i]]) |c| {
+            // A lone '&' would underline the next character as a mnemonic.
+            if (c == '&') {
+                label[len] = '&';
+                len += 1;
+            }
+            label[len] = c;
+            len += 1;
+        }
+        if (len == 0) {
+            const untitled = std.unicode.utf8ToUtf16LeStringLiteral("Untitled");
+            @memcpy(label[0..untitled.len], untitled);
+            len = untitled.len;
+        }
+        label[len] = 0;
+        const flags = w32.MF_STRING | if (i == self.active_tab) w32.MF_CHECKED else 0;
+        _ = w32.AppendMenuW(menu, flags, MENU_ID_BASE + i, @ptrCast(&label));
+    }
+
+    const cmd = self.trackButtonMenu(menu, .tab_list);
+    if (cmd < MENU_ID_BASE) return;
+    const choice: usize = @as(usize, @intCast(cmd)) - MENU_ID_BASE;
+    if (choice >= count) return;
+    const idx = self.findTabIndex(surfaces[choice]) orelse return;
+    self.selectTabIndex(idx);
+    self.invalidateTabBar();
+}
+
+/// Track `menu` below `button`, showing the button pressed while the menu
+/// is open. Returns the chosen command id, or 0, including when the window
+/// was destroyed while the menu was open (`self` is freed then).
+fn trackButtonMenu(self: *Window, menu: w32.HMENU, button: TitleButton) i32 {
+    const hwnd = self.hwnd orelse return 0;
+    const rect = self.title_button_rects.get(button);
+    // Buttons on the right open their menu leftwards so it stays on screen.
+    const align_right = button == .tab_list or button == .main_menu;
+    var pt = w32.POINT{ .x = if (align_right) rect.right else rect.left, .y = rect.bottom };
+    _ = w32.ClientToScreen(hwnd, &pt);
+
+    self.hover_button = button;
+    self.pressed_button = button;
+    self.invalidateTabBar();
+
+    // The menu's modal loop dispatches messages: if the shell exits, its
+    // tab and possibly the whole window can close before this returns.
+    const flags = w32.TPM_TOPALIGN | w32.TPM_RETURNCMD |
+        if (align_right) w32.TPM_RIGHTALIGN else w32.TPM_LEFTALIGN;
+    const cmd = w32.TrackPopupMenuEx(menu, flags, pt.x, pt.y, hwnd, null);
+    if (w32.IsWindow(hwnd) == 0) return 0;
+
+    self.hover_button = .none;
+    self.pressed_button = .none;
+    self.invalidateTabBar();
+    return cmd;
+}
+
+/// Run a menu action on the active surface, like its keybinding would.
+fn performMenuAction(self: *Window, action: input.Binding.Action) void {
+    const surface = self.getActiveSurface() orelse return;
+    if (!surface.core_surface_ready) return;
+    _ = surface.core_surface.performBindingAction(action) catch |err| {
+        log.err("menu action error: {}", .{err});
+    };
+}
+
 /// Handle WM_MOUSELEAVE: reset all hover state and repaint.
 fn handleTabBarMouseLeave(self: *Window) void {
     self.tracking_mouse = false;
-    if (self.hover_tab != -1 or self.hover_new_tab) {
+    // Caption buttons are non-client; WM_NCMOUSELEAVE clears those.
+    const client_button = self.hover_button != .none and !self.hover_button.isCaption();
+    if (self.hover_tab != -1 or client_button) {
         self.hover_tab = -1;
         self.hover_close = false;
-        self.hover_new_tab = false;
+        if (client_button) self.hover_button = .none;
         self.invalidateTabBar();
     }
 }
@@ -2060,10 +2600,7 @@ fn onDestroy(self: *Window) void {
 
     // Quick terminal windows are managed by QuickTerminal, not the windows list.
     if (self.is_quick_terminal) {
-        if (self.tab_font) |font| {
-            _ = w32.DeleteObject(font);
-            self.tab_font = null;
-        }
+        self.deleteFonts();
         self.hwnd = null;
         // QuickTerminal handles the rest of cleanup (freeing self, quit timer).
         if (app.quick_terminal) |qt| {
@@ -2081,10 +2618,7 @@ fn onDestroy(self: *Window) void {
     }
 
     // Clean up Window-level resources.
-    if (self.tab_font) |font| {
-        _ = w32.DeleteObject(font);
-        self.tab_font = null;
-    }
+    self.deleteFonts();
     self.hwnd = null;
 
     // Free the Window allocation.
@@ -2169,6 +2703,96 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
+        w32.WM_NCCALCSIZE => {
+            if (wparam == 0 or !window.integratedTitlebar())
+                return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            // Let Windows size the side and bottom borders, then move the
+            // top back so the client area (and our tab bar) starts at the
+            // window's top edge, replacing the system caption. Maximized
+            // windows hang their resize border off the monitor, so keep that
+            // much inset or the top of the tab bar would be cut off.
+            const params: *w32.NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const top = params.rgrc[0].top;
+            const result = w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (result != 0) return result;
+            params.rgrc[0].top = top;
+            if (w32.IsZoomed(hwnd) != 0) {
+                params.rgrc[0].top += window.resizeBorderHeight();
+                insetForAutoHideTaskbar(hwnd, &params.rgrc[0]);
+            }
+            return 0;
+        },
+        w32.WM_DPICHANGED => {
+            const dpi: u32 = @intCast(wparam & 0xFFFF);
+            window.handleDpiChange(dpi, @ptrFromInt(@as(usize, @bitCast(lparam))));
+            return 0;
+        },
+        w32.WM_NCHITTEST => {
+            const hit = w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (hit != w32.HTCLIENT or !window.integratedTitlebar()) return hit;
+            var pt = w32.POINT{
+                .x = @as(i16, @truncate(lparam & 0xFFFF)),
+                .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+            };
+            _ = w32.ScreenToClient(hwnd, &pt);
+            return window.hitTestTitlebar(pt.x, pt.y);
+        },
+        w32.WM_NCACTIVATE => {
+            window.window_active = wparam != 0;
+            window.invalidateTabBar();
+            // lparam -1 skips repainting the system caption we replaced.
+            if (window.integratedTitlebar()) return w32.DefWindowProcW(hwnd, msg, wparam, -1);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        // Caption buttons report HTMINBUTTON/HTMAXBUTTON/HTCLOSE so Windows
+        // treats them as such (Snap Layouts on maximize), but
+        // DefWindowProc would draw and track its classic buttons for them,
+        // so handle their mouse input here.
+        w32.WM_NCMOUSEMOVE => {
+            const button = TitleButton.fromHitTest(wparam);
+            if (!window.integratedTitlebar()) return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (!window.tracking_nc_mouse) {
+                var tme = w32.TRACKMOUSEEVENT{
+                    .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+                    .dwFlags = w32.TME_LEAVE | w32.TME_NONCLIENT,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                _ = w32.TrackMouseEvent(&tme);
+                window.tracking_nc_mouse = true;
+            }
+            window.setHoverButton(button);
+            if (button != .none) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_NCMOUSELEAVE => {
+            window.tracking_nc_mouse = false;
+            window.pressed_button = .none;
+            if (window.hover_button.isCaption()) window.setHoverButton(.none);
+            return 0;
+        },
+        w32.WM_NCLBUTTONDOWN, w32.WM_NCLBUTTONDBLCLK => {
+            const button = TitleButton.fromHitTest(wparam);
+            // A press elsewhere (e.g. starting a caption drag) must not
+            // leave an earlier caption button pressed.
+            window.pressed_button = if (window.integratedTitlebar()) button else .none;
+            window.invalidateTabBar();
+            if (window.pressed_button == .none)
+                return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            return 0;
+        },
+        w32.WM_NCLBUTTONUP => {
+            const button = TitleButton.fromHitTest(wparam);
+            // Clear on every release, wherever it lands, so a press dragged
+            // off a button can't be completed by an unrelated later release.
+            const pressed = window.pressed_button;
+            window.pressed_button = .none;
+            window.invalidateTabBar();
+            if (button == .none or !window.integratedTitlebar())
+                return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (pressed == button) window.activateCaptionButton(button);
+            return 0;
+        },
         w32.WM_SIZE => {
             // Minimizing does not hide child surface HWNDs, so tell the core
             // to stop rendering the active tab while minimized. Return early:
@@ -2367,7 +2991,7 @@ pub fn windowWndProc(
                     const first_w = window.tab_rects[0].right - window.tab_rects[0].left;
                     var target: usize = 0;
                     for (0..window.tab_count) |i| {
-                        const slot_left: i32 = @intCast(@as(i32, @intCast(i)) * first_w);
+                        const slot_left: i32 = window.tab_rects[0].left + @as(i32, @intCast(i)) * first_w;
                         const slot_mid = slot_left + @divTrunc(first_w, 2);
                         if (x >= slot_mid) {
                             target = i;

@@ -832,23 +832,18 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        // Convert client size to window size (accounts for
-                        // title bar, borders, scrollbar).
-                        var rect = w32.RECT{
-                            .left = 0,
-                            .top = 0,
-                            .right = @intCast(value.width),
-                            .bottom = @intCast(value.height),
-                        };
-                        _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
+                    const window = core_surface.rt_surface.parent_window;
+                    if (window.hwnd) |h| {
+                        // Convert the terminal size to a window size (adds
+                        // the tab/title bar and borders).
+                        const size = window.windowSizeForSurface(value.width, value.height);
                         _ = w32.SetWindowPos(
                             h,
                             null,
                             0,
                             0,
-                            rect.right - rect.left,
-                            rect.bottom - rect.top,
+                            size.width,
+                            size.height,
                             w32.SWP_NOZORDER | w32.SWP_NOMOVE,
                         );
                     }
@@ -977,22 +972,17 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
+                    const window = core_surface.rt_surface.parent_window;
+                    if (window.hwnd) |h| {
                         // Reset to default 800x600
-                        var rect = w32.RECT{
-                            .left = 0,
-                            .top = 0,
-                            .right = 800,
-                            .bottom = 600,
-                        };
-                        _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
+                        const size = window.windowSizeForSurface(800, 600);
                         _ = w32.SetWindowPos(
                             h,
                             null,
                             0,
                             0,
-                            rect.right - rect.left,
-                            rect.bottom - rect.top,
+                            size.width,
+                            size.height,
                             w32.SWP_NOZORDER | w32.SWP_NOMOVE,
                         );
                     }

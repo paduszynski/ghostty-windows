@@ -1598,3 +1598,88 @@ pub const ITaskbarList3 = extern struct {
         _ = self.vtable.SetProgressValue(self, hwnd, completed, total);
     }
 };
+
+// --- Custom (integrated) title bar ---
+
+pub const WM_NCCALCSIZE: u32 = 0x0083;
+pub const WM_NCHITTEST: u32 = 0x0084;
+pub const WM_NCACTIVATE: u32 = 0x0086;
+pub const WM_NCMOUSEMOVE: u32 = 0x00A0;
+pub const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+pub const WM_NCLBUTTONUP: u32 = 0x00A2;
+pub const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
+pub const WM_NCMOUSELEAVE: u32 = 0x02A2;
+pub const WM_SYSCOMMAND: u32 = 0x0112;
+
+// WM_NCHITTEST results
+pub const HTNOWHERE: isize = 0;
+pub const HTCAPTION: isize = 2;
+pub const HTMINBUTTON: isize = 8;
+pub const HTMAXBUTTON: isize = 9;
+pub const HTTOP: isize = 12;
+pub const HTTOPLEFT: isize = 13;
+pub const HTTOPRIGHT: isize = 14;
+pub const HTCLOSE: isize = 20;
+
+pub const SM_CXFRAME: i32 = 32;
+pub const SM_CYFRAME: i32 = 33;
+pub const SM_CXPADDEDBORDER: i32 = 92;
+
+pub const SC_MINIMIZE: usize = 0xF020;
+pub const SC_MAXIMIZE: usize = 0xF030;
+pub const SC_RESTORE: usize = 0xF120;
+
+pub const TME_NONCLIENT: u32 = 0x00000010;
+pub const MF_CHECKED: u32 = 0x00000008;
+pub const MF_POPUP: u32 = 0x00000010;
+pub const TPM_RIGHTALIGN: u32 = 0x0008;
+pub const DT_CENTER: u32 = 1;
+
+pub const NCCALCSIZE_PARAMS = extern struct {
+    rgrc: [3]RECT,
+    lppos: ?*anyopaque,
+};
+
+pub extern "user32" fn GetSystemMetricsForDpi(
+    nIndex: i32,
+    dpi: u32,
+) callconv(.winapi) i32;
+
+pub extern "gdi32" fn GetTextFaceW(
+    hdc: HDC,
+    c: i32,
+    lpName: [*]u16,
+) callconv(.winapi) i32;
+
+pub extern "user32" fn IsWindow(
+    hWnd: ?HWND,
+) callconv(.winapi) i32;
+
+pub extern "user32" fn AdjustWindowRectExForDpi(
+    lpRect: *RECT,
+    dwStyle: u32,
+    bMenu: i32,
+    dwExStyle: u32,
+    dpi: u32,
+) callconv(.winapi) i32;
+
+// Auto-hide taskbar detection, for maximized windows with a custom frame.
+pub const ABM_GETAUTOHIDEBAREX: u32 = 0x0000000B;
+pub const ABE_LEFT: u32 = 0;
+pub const ABE_TOP: u32 = 1;
+pub const ABE_RIGHT: u32 = 2;
+pub const ABE_BOTTOM: u32 = 3;
+
+pub const APPBARDATA = extern struct {
+    cbSize: u32,
+    hWnd: ?HWND,
+    uCallbackMessage: u32,
+    uEdge: u32,
+    rc: RECT,
+    lParam: isize,
+};
+
+pub extern "shell32" fn SHAppBarMessage(
+    dwMessage: u32,
+    pData: *APPBARDATA,
+) callconv(.winapi) usize;
