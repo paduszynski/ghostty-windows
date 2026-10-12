@@ -700,6 +700,7 @@ pub fn init(
             .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
             .resources_dir = global.resourcesDir().host(),
             .term = config.term,
+            .wsl_relay = config.@"wsl-relay",
             .rt_pre_exec_info = .init(config),
             .rt_post_fork_info = .init(config),
         });

@@ -72,6 +72,7 @@ pub const FALSE: windows.BOOL = .fromBool(false);
 pub const TRUE: windows.BOOL = .fromBool(true);
 
 // Bit-field and enum constant values
+pub const CREATE_NO_WINDOW = 0x08000000;
 pub const CREATE_UNICODE_ENVIRONMENT = 0x00000400;
 pub const EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
 pub const FILE_ATTRIBUTE_NORMAL = 0x80;
@@ -101,6 +102,51 @@ pub const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = ProcThreadAttributeValue(
     true,
     false,
 );
+pub const PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(
+    .ProcThreadAttributeHandleList,
+    false,
+    true,
+    false,
+);
+pub const PROC_THREAD_ATTRIBUTE_JOB_LIST = ProcThreadAttributeValue(
+    .ProcThreadAttributeJobList,
+    false,
+    true,
+    false,
+);
+
+pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+pub const JobObjectExtendedLimitInformation = 9;
+
+pub const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+    PerProcessUserTimeLimit: i64,
+    PerJobUserTimeLimit: i64,
+    LimitFlags: DWORD,
+    MinimumWorkingSetSize: SIZE_T,
+    MaximumWorkingSetSize: SIZE_T,
+    ActiveProcessLimit: DWORD,
+    Affinity: ULONG_PTR,
+    PriorityClass: DWORD,
+    SchedulingClass: DWORD,
+};
+
+pub const IO_COUNTERS = extern struct {
+    ReadOperationCount: u64,
+    WriteOperationCount: u64,
+    OtherOperationCount: u64,
+    ReadTransferCount: u64,
+    WriteTransferCount: u64,
+    OtherTransferCount: u64,
+};
+
+pub const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+    BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    IoInfo: IO_COUNTERS,
+    ProcessMemoryLimit: SIZE_T,
+    JobMemoryLimit: SIZE_T,
+    PeakProcessMemoryUsed: SIZE_T,
+    PeakJobMemoryUsed: SIZE_T,
+};
 
 // Types needed for ntdll calls
 pub const ACCESS_MASK = windows.ACCESS_MASK;
@@ -242,6 +288,39 @@ pub const exp = struct {
             lpNumberOfBytesRead: ?*DWORD,
             lpOverlapped: ?*OVERLAPPED,
         ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn WriteFile(
+            hFile: HANDLE,
+            lpBuffer: *const anyopaque,
+            nNumberOfBytesToWrite: DWORD,
+            lpNumberOfBytesWritten: ?*DWORD,
+            lpOverlapped: ?*OVERLAPPED,
+        ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn GetOverlappedResult(
+            hFile: HANDLE,
+            lpOverlapped: *OVERLAPPED,
+            lpNumberOfBytesTransferred: *DWORD,
+            bWait: BOOL,
+        ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn CreateJobObjectW(
+            lpJobAttributes: ?*SECURITY_ATTRIBUTES,
+            lpName: ?LPCWSTR,
+        ) callconv(.winapi) ?HANDLE;
+        pub extern "kernel32" fn SetInformationJobObject(
+            hJob: HANDLE,
+            JobObjectInformationClass: c_int,
+            lpJobObjectInformation: *anyopaque,
+            cbJobObjectInformationLength: DWORD,
+        ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn TerminateJobObject(
+            hJob: HANDLE,
+            uExitCode: UINT,
+        ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn CreateEventW(
+            lpEventAttributes: ?*SECURITY_ATTRIBUTES,
+            bManualReset: BOOL,
+            bInitialState: BOOL,
+            lpName: ?LPCWSTR,
+        ) callconv(.winapi) ?HANDLE;
     };
     pub const ntdll = struct {
         pub extern "ntdll" fn NtCreateFile(
@@ -261,6 +340,8 @@ pub const exp = struct {
 };
 
 pub const ProcThreadAttributeNumber = enum(DWORD) {
+    ProcThreadAttributeHandleList = 2,
+    ProcThreadAttributeJobList = 13,
     ProcThreadAttributePseudoConsole = 22,
     _,
 };

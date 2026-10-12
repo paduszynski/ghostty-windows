@@ -104,6 +104,16 @@ rt_post_fork_info: RtPostForkInfo,
 pseudo_console: if (builtin.os.tag == .windows) ?windows.HPCON else void =
     if (builtin.os.tag == .windows) null else {},
 
+/// Windows only: start a console program without a console window.
+/// Without a pseudo console, a console program started from a GUI
+/// process otherwise gets a new visible console window.
+create_no_window: bool = false,
+
+/// Windows only: start the process in this job object, along with the
+/// processes it starts. Only used without a pseudo console.
+job: if (builtin.os.tag == .windows) ?windows.HANDLE else void =
+    if (builtin.os.tag == .windows) null else {},
+
 /// User data that is sent to the callback. Set with setData and getData
 /// for a more user-friendly API.
 data: ?*anyopaque = null,
@@ -388,12 +398,68 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         const stdin = if (self.stdin) |f| f.handle else null_fd.?;
         const stdout = if (self.stdout) |f| f.handle else null_fd.?;
         const stderr = if (self.stderr) |f| f.handle else null_fd.?;
-        break :b .{ null, stdin, stdout, stderr };
+
+        // Let the child inherit only its std handles. Other inheritable
+        // handles, such as another tab's pipes while it is starting, would
+        // otherwise leak into the child and keep those pipes open.
+        const handles = try arena.alloc(windows.HANDLE, 3);
+        var handle_count: usize = 0;
+        for ([_]windows.HANDLE{ stdin, stdout, stderr }) |h| {
+            if (std.mem.indexOfScalar(windows.HANDLE, handles[0..handle_count], h) == null) {
+                handles[handle_count] = h;
+                handle_count += 1;
+            }
+        }
+
+        const attribute_count: windows.DWORD = if (self.job != null) 2 else 1;
+        var attribute_list_size: usize = undefined;
+        _ = windows.exp.kernel32.InitializeProcThreadAttributeList(
+            null,
+            attribute_count,
+            0,
+            &attribute_list_size,
+        );
+
+        const attribute_list_buf = try arena.alloc(u8, attribute_list_size);
+        if (windows.exp.kernel32.InitializeProcThreadAttributeList(
+            attribute_list_buf.ptr,
+            attribute_count,
+            0,
+            &attribute_list_size,
+        ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
+
+        if (windows.exp.kernel32.UpdateProcThreadAttribute(
+            attribute_list_buf.ptr,
+            0,
+            windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            @ptrCast(handles.ptr),
+            handle_count * @sizeOf(windows.HANDLE),
+            null,
+            null,
+        ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
+
+        // Creating the process in the job, rather than assigning it after,
+        // leaves no window for it to start children outside the job.
+        if (self.job) |job| {
+            const jobs = try arena.alloc(windows.HANDLE, 1);
+            jobs[0] = job;
+            if (windows.exp.kernel32.UpdateProcThreadAttribute(
+                attribute_list_buf.ptr,
+                0,
+                windows.PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                @ptrCast(jobs.ptr),
+                @sizeOf(windows.HANDLE),
+                null,
+                null,
+            ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
+        }
+
+        break :b .{ attribute_list_buf.ptr, stdin, stdout, stderr };
     };
 
     var startup_info_ex = windows.STARTUPINFOEX{
         .StartupInfo = .{
-            .cb = if (attribute_list != null) @sizeOf(windows.STARTUPINFOEX) else @sizeOf(windows.STARTUPINFOW),
+            .cb = @sizeOf(windows.STARTUPINFOEX),
             .hStdError = stderr,
             .hStdOutput = stdout,
             .hStdInput = stdin,
@@ -415,8 +481,8 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         .lpAttributeList = attribute_list,
     };
 
-    var flags: windows.DWORD = windows.CREATE_UNICODE_ENVIRONMENT;
-    if (attribute_list != null) flags |= windows.EXTENDED_STARTUPINFO_PRESENT;
+    var flags: windows.DWORD = windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT;
+    if (self.create_no_window) flags |= windows.CREATE_NO_WINDOW;
 
     var process_information: windows.PROCESS_INFORMATION = undefined;
     if (windows.exp.kernel32.CreateProcessW(

@@ -675,6 +675,9 @@ pub const Config = struct {
     working_directory: ?[]const u8 = null,
     resources_dir: ?[]const u8,
     term: []const u8,
+    /// Windows only: run wsl.exe commands through the WSL relay script
+    /// instead of ConPTY. See the `wsl-relay` config.
+    wsl_relay: bool = false,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -695,6 +698,10 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+
+    /// Windows only: the WSL relay script, if `args` is a wsl.exe command
+    /// that should run through it rather than ConPTY. See wslRelayArgs.
+    wsl_relay_script: ?[]const u8 = null,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -968,11 +975,17 @@ const Subprocess = struct {
         // https://github.com/ghostty-org/ghostty/discussions/7769
         if (cwd) |pwd| try env.put("PWD", pwd);
 
+        const wsl_relay_script: ?[]const u8 = if (comptime builtin.os.tag == .windows)
+            try wslRelayScript(alloc, cfg, args)
+        else
+            null;
+
         return .{
             .arena = arena,
             .env = env,
             .cwd = cwd,
             .args = args,
+            .wsl_relay_script = wsl_relay_script,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
@@ -1007,12 +1020,17 @@ const Subprocess = struct {
         var in_child: bool = false;
 
         // Create our pty
-        var pty = try Pty.open(.{
+        const size: ptypkg.winsize = .{
             .ws_row = @intCast(self.grid_size.rows),
             .ws_col = @intCast(self.grid_size.columns),
             .ws_xpixel = @intCast(self.screen_size.width),
             .ws_ypixel = @intCast(self.screen_size.height),
-        });
+        };
+        const wsl_relay = builtin.os.tag == .windows and self.wsl_relay_script != null;
+        var pty = if (comptime builtin.os.tag == .windows)
+            try (if (self.wsl_relay_script != null) Pty.openPipes(size) else Pty.open(size))
+        else
+            try Pty.open(size);
         self.pty = pty;
         errdefer if (!in_child) {
             if (comptime builtin.os.tag != .windows) {
@@ -1118,25 +1136,40 @@ const Subprocess = struct {
             };
         }
 
+        const args = if (wsl_relay) try wslRelayArgs(
+            self.arena.allocator(),
+            self.args,
+            self.wsl_relay_script.?,
+            size,
+        ) else self.args;
+
         // Build our subcommand
         var cmd: Command = .{
-            .path = self.args[0],
-            .args = self.args,
+            .path = args[0],
+            .args = args,
             .env = if (self.env) |*env| env else null,
             .cwd = cwd,
-            .stdin = if (builtin.os.tag == .windows) null else .{
+            .stdin = if (builtin.os.tag == .windows)
+                if (wsl_relay) .{ .handle = pty.in_pipe_pty, .flags = .{ .nonblocking = false } } else null
+            else .{
                 .handle = pty.slave,
                 .flags = .{ .nonblocking = false },
             },
-            .stdout = if (builtin.os.tag == .windows) null else .{
+            .stdout = if (builtin.os.tag == .windows)
+                if (wsl_relay) .{ .handle = pty.out_pipe_pty, .flags = .{ .nonblocking = false } } else null
+            else .{
                 .handle = pty.slave,
                 .flags = .{ .nonblocking = false },
             },
-            .stderr = if (builtin.os.tag == .windows) null else .{
+            .stderr = if (builtin.os.tag == .windows)
+                if (wsl_relay) .{ .handle = pty.out_pipe_pty, .flags = .{ .nonblocking = false } } else null
+            else .{
                 .handle = pty.slave,
                 .flags = .{ .nonblocking = false },
             },
             .pseudo_console = if (builtin.os.tag == .windows) pty.pseudo_console else {},
+            .create_no_window = wsl_relay,
+            .job = if (builtin.os.tag == .windows) pty.job else {},
             .os_pre_exec = switch (comptime builtin.os.tag) {
                 .windows => null,
                 else => f: {
@@ -1179,6 +1212,15 @@ const Subprocess = struct {
             log.warn("error killing command during cleanup err={}", .{err});
         };
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
+
+        // The child has its own copies of the relay pipes now; closing ours
+        // lets reads see BROKEN_PIPE when it exits.
+        if (comptime builtin.os.tag == .windows) {
+            if (wsl_relay) {
+                log.info("running wsl.exe through the WSL relay command={f}", .{ArgsFormatter{ .args = args }});
+                self.pty.?.closeChildEnds();
+            }
+        }
 
         self.process = .{ .fork_exec = cmd };
         return switch (builtin.os.tag) {
@@ -1938,6 +1980,171 @@ pub const ReadThread = struct {
         }
     }
 };
+
+/// Whether `arg0` runs WSL: `wsl` or `wsl.exe`, with or without a path.
+fn isWslCommand(arg0: []const u8) bool {
+    const start = if (std.mem.lastIndexOfAny(u8, arg0, "\\/")) |i| i + 1 else 0;
+    const name = arg0[start..];
+    return std.ascii.eqlIgnoreCase(name, "wsl") or std.ascii.eqlIgnoreCase(name, "wsl.exe");
+}
+
+/// The wsl.exe options that can come before the command when running
+/// through the relay, and whether each takes a value. Anything else, such
+/// as the management options (--install, --list, ...), runs as is.
+const wsl_relay_options = [_]struct { []const u8, bool }{
+    .{ "-d", true },
+    .{ "--distribution", true },
+    .{ "--distribution-id", true },
+    .{ "-u", true },
+    .{ "--user", true },
+    .{ "--cd", true },
+};
+
+/// Whether wsl.exe `args` (without args[0]) can run through the relay.
+fn wslArgsSupported(args: []const [:0]const u8) bool {
+    var i: usize = 0;
+    // `wsl ~` starts in the home directory.
+    if (i < args.len and std.mem.eql(u8, args[i], "~")) i += 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--") or
+            std.mem.eql(u8, arg, "-e") or
+            std.mem.eql(u8, arg, "--exec")) return true;
+        for (wsl_relay_options) |opt| {
+            if (std.mem.eql(u8, arg, opt[0])) {
+                if (opt[1]) i += 1;
+                break;
+            }
+        } else return false;
+    }
+    return i == args.len;
+}
+
+/// Windows only: the path of the WSL relay script if `args` should run
+/// through it rather than ConPTY, or null.
+fn wslRelayScript(
+    alloc: Allocator,
+    cfg: Config,
+    args: []const [:0]const u8,
+) Allocator.Error!?[]const u8 {
+    if (!cfg.wsl_relay or args.len == 0 or !isWslCommand(args[0])) return null;
+    if (!wslArgsSupported(args[1..])) {
+        log.info("wsl.exe arguments not supported by the WSL relay, using ConPTY", .{});
+        return null;
+    }
+    const dir = cfg.resources_dir orelse {
+        log.warn("no resources dir set, WSL relay disabled", .{});
+        return null;
+    };
+    const path = try std.fs.path.join(alloc, &.{ dir, "wsl", "ghostty-wsl-relay.py" });
+    std.Io.Dir.cwd().access(global.io(), path, .{}) catch |err| {
+        log.warn("WSL relay script not found path={s} err={}", .{ path, err });
+        return null;
+    };
+    return path;
+}
+
+/// Starts the WSL relay script inside the distro: converts its Windows
+/// path, and explains when python3 is missing.
+const wsl_relay_bootstrap =
+    \\if command -v python3 >/dev/null 2>&1; then exec python3 "$(wslpath -u "$0")" "$@"; fi
+    \\printf 'Ghostty: the WSL relay needs python3 in this distro. Install it, or set wsl-relay = false.\r\n' >&2
+    \\exit 127
+;
+
+/// Rewrite the wsl.exe command `args` to run its command (or the login
+/// shell) through the relay `script`, on a Linux pty of the given size:
+///
+///   wsl.exe [options] [-- cmd... | --exec cmd...]
+///   wsl.exe [options] --exec sh -c BOOTSTRAP SCRIPT --size ... [--sh] -- [cmd...]
+fn wslRelayArgs(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+    script: []const u8,
+    size: ptypkg.winsize,
+) Allocator.Error![]const [:0]const u8 {
+    var result: std.ArrayList([:0]const u8) = .empty;
+    try result.append(alloc, args[0]);
+
+    var i: usize = 1;
+    if (i < args.len and std.mem.eql(u8, args[i], "~")) {
+        // `~` is only special as the sole argument; spell it out.
+        try result.appendSlice(alloc, &.{ "--cd", "~" });
+        i += 1;
+    }
+
+    var via_shell = false;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            via_shell = true;
+            i += 1;
+            break;
+        }
+        if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--exec")) {
+            i += 1;
+            break;
+        }
+        try result.append(alloc, arg);
+    }
+
+    try result.appendSlice(alloc, &.{
+        "--exec",
+        "sh",
+        "-c",
+        wsl_relay_bootstrap,
+        try alloc.dupeZ(u8, script),
+        "--size",
+        try std.fmt.allocPrintSentinel(alloc, "{d},{d},{d},{d}", .{
+            size.ws_row,
+            size.ws_col,
+            size.ws_xpixel,
+            size.ws_ypixel,
+        }, 0),
+        "--version",
+        try alloc.dupeZ(u8, build_config.version_string),
+    });
+    if (via_shell) try result.append(alloc, "--sh");
+    try result.append(alloc, "--");
+    try result.appendSlice(alloc, args[i..]);
+    return result.items;
+}
+
+test "wslRelayArgs" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const size: ptypkg.winsize = .{ .ws_row = 50, .ws_col = 190, .ws_xpixel = 1900, .ws_ypixel = 1000 };
+
+    try testing.expect(isWslCommand("wsl"));
+    try testing.expect(isWslCommand("C:\\Windows\\System32\\WSL.EXE"));
+    try testing.expect(!isWslCommand("wslg.exe"));
+
+    try testing.expect(wslArgsSupported(&.{}));
+    try testing.expect(wslArgsSupported(&.{ "-d", "FedoraLinux", "--cd", "~" }));
+    try testing.expect(wslArgsSupported(&.{ "~", "--", "htop", "-d", "5" }));
+    try testing.expect(!wslArgsSupported(&.{"--list"}));
+    try testing.expect(!wslArgsSupported(&.{"-d"}));
+
+    const login = try wslRelayArgs(alloc, &.{ "wsl.exe", "-d", "FedoraLinux", "--cd", "~" }, "C:\\g\\relay.py", size);
+    try testing.expectEqual(@as(usize, 15), login.len);
+    try testing.expectEqualStrings("FedoraLinux", login[2]);
+    try testing.expectEqualStrings("--exec", login[5]);
+    try testing.expectEqualStrings("C:\\g\\relay.py", login[9]);
+    try testing.expectEqualStrings("50,190,1900,1000", login[11]);
+    try testing.expectEqualStrings("--", login[14]);
+
+    const shell = try wslRelayArgs(alloc, &.{ "wsl", "~", "--", "htop", "-d", "5" }, "r.py", size);
+    try testing.expectEqualStrings("--cd", shell[1]);
+    try testing.expectEqualStrings("~", shell[2]);
+    try testing.expectEqualStrings("--sh", shell[shell.len - 5]);
+    try testing.expectEqualStrings("htop", shell[shell.len - 3]);
+
+    const exec = try wslRelayArgs(alloc, &.{ "wsl", "-e", "top" }, "r.py", size);
+    try testing.expectEqualStrings("--", exec[exec.len - 2]);
+    try testing.expectEqualStrings("top", exec[exec.len - 1]);
+}
 
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since

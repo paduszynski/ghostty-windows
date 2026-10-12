@@ -3859,6 +3859,18 @@ else
 /// from working properly. https://github.com/vim/vim/pull/13211 fixes this.
 term: []const u8 = "xterm-ghostty",
 
+/// Windows only: when `command` runs `wsl.exe` (or `wsl`), run the command
+/// on a Linux pty inside WSL and relay it to Ghostty over pipes, instead of
+/// through a Windows pseudo console (ConPTY). ConPTY re-encodes the terminal
+/// stream and drops sequences it doesn't understand, which breaks the kitty
+/// graphics protocol (inline images) among others. It also hides `TERM` and
+/// `TERM_PROGRAM` from programs inside WSL.
+///
+/// The relay is a Python script shipped with Ghostty
+/// (`share/ghostty/wsl/ghostty-wsl-relay.py`), so the distro needs
+/// `python3`. Set this to `false` to use ConPTY instead.
+@"wsl-relay": bool = true,
+
 /// String to send when we receive `ENQ` (`0x05`) from the command that we are
 /// running. Defaults to an empty string if not set.
 @"enquiry-response": []const u8 = "",

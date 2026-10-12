@@ -335,9 +335,16 @@ const WindowsPty = struct {
     in_pipe: windows.HANDLE,
     out_pipe_pty: windows.HANDLE,
     in_pipe_pty: windows.HANDLE,
-    pseudo_console: windows.HPCON,
-    /// Set by closeConsole once the pseudo console and our copies of its
-    /// pipe ends are closed.
+    /// Null for a pipe pty (see openPipes), where the child process gets
+    /// the pipes directly.
+    pseudo_console: ?windows.HPCON,
+    /// For a pipe pty, the job object the child runs in, so closeConsole
+    /// can end it along with every process it started.
+    job: ?windows.HANDLE,
+    /// Set once our copies of the child's pipe ends (in_pipe_pty,
+    /// out_pipe_pty) are closed.
+    child_ends_closed: bool,
+    /// Set by closeConsole.
     console_closed: bool,
     size: winsize,
 
@@ -345,6 +352,60 @@ const WindowsPty = struct {
 
     /// Open a new PTY with the given initial size.
     pub fn open(size: winsize) OpenError!Pty {
+        var pty = try createPipes(size);
+        errdefer pty.deinitPipes();
+
+        // Set the console codepage to UTF-8 before creating the pseudo
+        // console. ConPTY uses the active codepage at creation time for
+        // translating between VT (UTF-8) I/O and the Win32 console.
+        _ = windows.exp.kernel32.SetConsoleCP(65001);
+        _ = windows.exp.kernel32.SetConsoleOutputCP(65001);
+
+        var pseudo_console: windows.HPCON = undefined;
+        const result = windows.exp.kernel32.CreatePseudoConsole(
+            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
+            pty.in_pipe_pty,
+            pty.out_pipe_pty,
+            0,
+            &pseudo_console,
+        );
+        if (result != windows.S_OK) return error.Unexpected;
+        pty.pseudo_console = pseudo_console;
+        return pty;
+    }
+
+    /// Open the pipes for a child process that gets them directly as its
+    /// stdin and stdout/stderr instead of through a pseudo console. The
+    /// child ends (in_pipe_pty, out_pipe_pty) are inheritable; close them
+    /// with closeChildEnds once the child has started. Start the child in
+    /// `job`. The child itself is responsible for any terminal emulation,
+    /// such as the WSL relay; size changes are sent to it in the input
+    /// stream (see setSize).
+    pub fn openPipes(size: winsize) OpenError!Pty {
+        var pty = try createPipes(size);
+        errdefer pty.deinitPipes();
+
+        try setInheritable(pty.in_pipe_pty, true);
+        try setInheritable(pty.out_pipe_pty, true);
+
+        const job = windows.exp.kernel32.CreateJobObjectW(null, null) orelse
+            return windows.unexpectedError(windows.GetLastError());
+        errdefer _ = windows.exp.kernel32.CloseHandle(job);
+        var limits = std.mem.zeroes(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+        limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (windows.exp.kernel32.SetInformationJobObject(
+            job,
+            windows.JobObjectExtendedLimitInformation,
+            &limits,
+            @sizeOf(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+        ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
+
+        pty.job = job;
+        return pty;
+    }
+
+    /// Create the pipes, none of them inheritable.
+    fn createPipes(size: winsize) OpenError!Pty {
         var pty: Pty = undefined;
 
         var pipe_path_buf: [128]u8 = undefined;
@@ -426,41 +487,34 @@ const WindowsPty = struct {
             _ = windows.exp.kernel32.CloseHandle(pty.out_pipe_pty);
         }
 
-        const SetHandleInformation = struct {
-            fn f(hObject: windows.HANDLE) !void {
-                if (windows.exp.kernel32.SetHandleInformation(
-                    hObject,
-                    windows.HANDLE_FLAG_INHERIT,
-                    0,
-                ) == windows.FALSE) {
-                    return windows.unexpectedError(windows.GetLastError());
-                }
-            }
-        };
+        try setInheritable(pty.in_pipe, false);
+        try setInheritable(pty.out_pipe, false);
+        try setInheritable(pty.in_pipe_pty, false);
+        try setInheritable(pty.out_pipe_pty, false);
 
-        try SetHandleInformation.f(pty.in_pipe);
-        try SetHandleInformation.f(pty.in_pipe_pty);
-        try SetHandleInformation.f(pty.out_pipe);
-        try SetHandleInformation.f(pty.out_pipe_pty);
-
-        // Set the console codepage to UTF-8 before creating the pseudo
-        // console. ConPTY uses the active codepage at creation time for
-        // translating between VT (UTF-8) I/O and the Win32 console.
-        _ = windows.exp.kernel32.SetConsoleCP(65001);
-        _ = windows.exp.kernel32.SetConsoleOutputCP(65001);
-
-        const result = windows.exp.kernel32.CreatePseudoConsole(
-            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
-            pty.in_pipe_pty,
-            pty.out_pipe_pty,
-            0,
-            &pty.pseudo_console,
-        );
-        if (result != windows.S_OK) return error.Unexpected;
-
+        pty.pseudo_console = null;
+        pty.job = null;
+        pty.child_ends_closed = false;
         pty.console_closed = false;
         pty.size = size;
         return pty;
+    }
+
+    fn setInheritable(handle: windows.HANDLE, inherit: bool) OpenError!void {
+        if (windows.exp.kernel32.SetHandleInformation(
+            handle,
+            windows.HANDLE_FLAG_INHERIT,
+            if (inherit) windows.HANDLE_FLAG_INHERIT else 0,
+        ) == windows.FALSE) {
+            return windows.unexpectedError(windows.GetLastError());
+        }
+    }
+
+    fn deinitPipes(self: *Pty) void {
+        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
+        _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
+        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
+        _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
     }
 
     /// Close the pseudo console and our copies of the pipe ends it uses,
@@ -470,27 +524,40 @@ const WindowsPty = struct {
     /// read, so this is how the read thread is unblocked on shutdown.
     /// The read thread must still be draining out_pipe when this is called:
     /// before Windows 11 24H2, ClosePseudoConsole waits for conhost to flush.
+    ///
+    /// For a pipe pty this ends every process in the job instead, which
+    /// closes their copies of the output pipe. Killing just the child isn't
+    /// enough: wsl.exe, for one, hands its pipes to a second wsl.exe.
     pub fn closeConsole(self: *Pty) void {
         if (self.console_closed) return;
         self.console_closed = true;
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        if (self.pseudo_console) |pc| windows.exp.kernel32.ClosePseudoConsole(pc);
+        if (self.job) |job| _ = windows.exp.kernel32.TerminateJobObject(job, 1);
+        self.closeChildEnds();
+    }
+
+    /// Close our copies of the child's pipe ends. For a pipe pty, call this
+    /// once the child has started, so out_pipe reads fail with BROKEN_PIPE
+    /// when it exits.
+    pub fn closeChildEnds(self: *Pty) void {
+        if (self.child_ends_closed) return;
+        self.child_ends_closed = true;
         _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
     }
 
     pub fn deinit(self: *Pty) void {
+        // If the console is still open nobody is reading out_pipe any
+        // more, so close our pipe ends first to keep ClosePseudoConsole
+        // from waiting on a flush.
+        self.closeChildEnds();
+        _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
+        _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
         if (!self.console_closed) {
-            // Nobody is reading out_pipe any more, so close our ends first
-            // to keep ClosePseudoConsole from waiting on a flush.
-            _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
-            _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
-            _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
-            _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
-            _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
-        } else {
-            _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
-            _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
+            if (self.pseudo_console) |pc| windows.exp.kernel32.ClosePseudoConsole(pc);
         }
+        // Closing the job ends anything still running in it.
+        if (self.job) |job| _ = windows.exp.kernel32.CloseHandle(job);
         self.* = undefined;
     }
 
@@ -505,13 +572,48 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = windows.exp.kernel32.ResizePseudoConsole(
-            self.pseudo_console,
-            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
-        );
-
-        if (result != windows.S_OK) return error.ResizeFailed;
+        if (self.pseudo_console) |pc| {
+            const result = windows.exp.kernel32.ResizePseudoConsole(
+                pc,
+                .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
+            );
+            if (result != windows.S_OK) return error.ResizeFailed;
+        } else {
+            try self.writeSizeMessage(size);
+        }
         self.size = size;
+    }
+
+    /// The input stream message that tells the child of a pipe pty about a
+    /// size change; the WSL relay strips it out of the input.
+    pub const size_message_prefix = "\x1b_GhosttyWinsize;";
+
+    /// Send a size change to the child of a pipe pty, in the input stream.
+    fn writeSizeMessage(self: *Pty, size: winsize) SetSizeError!void {
+        var buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, size_message_prefix ++ "{d};{d};{d};{d}\x1b\\", .{
+            size.ws_row,
+            size.ws_col,
+            size.ws_xpixel,
+            size.ws_ypixel,
+        }) catch unreachable;
+
+        // in_pipe is overlapped and bound to the termio IOCP. Setting the
+        // low bit of the event handle keeps this write's completion off
+        // the port, so we can wait for it here. A single write keeps the
+        // message in one piece between the queued terminal input writes.
+        const event = windows.exp.kernel32.CreateEventW(null, windows.TRUE, windows.FALSE, null) orelse
+            return error.ResizeFailed;
+        defer _ = windows.exp.kernel32.CloseHandle(event);
+        var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+        overlapped.hEvent = @ptrFromInt(@intFromPtr(event) | 1);
+
+        var written: windows.DWORD = 0;
+        if (windows.exp.kernel32.WriteFile(self.in_pipe, msg.ptr, @intCast(msg.len), null, &overlapped) == windows.FALSE) {
+            if (windows.GetLastError() != .IO_PENDING) return error.ResizeFailed;
+        }
+        if (windows.exp.kernel32.GetOverlappedResult(self.in_pipe, &overlapped, &written, windows.TRUE) == windows.FALSE or
+            written != msg.len) return error.ResizeFailed;
     }
 
     /// Get information about the process(es) attached to the PTY. Returns

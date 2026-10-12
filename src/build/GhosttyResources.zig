@@ -125,6 +125,16 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
         try steps.append(b.allocator, &install_step.step);
     }
 
+    // The WSL relay script, which the Windows runtime runs inside WSL
+    // distros instead of using ConPTY (see the wsl-relay config).
+    if (cfg.target.result.os.tag == .windows) {
+        const install_step = b.addInstallFile(
+            b.path("src/apprt/win32/ghostty-wsl-relay.py"),
+            "share/ghostty/wsl/ghostty-wsl-relay.py",
+        );
+        try steps.append(b.allocator, &install_step.step);
+    }
+
     // Themes
     if (cfg.emit_themes) {
         if (b.lazyDependency("iterm2_themes", .{})) |upstream| {
