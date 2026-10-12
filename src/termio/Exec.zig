@@ -253,6 +253,11 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     }
 
     if (comptime builtin.os.tag == .windows) {
+        // The read thread blocks in a synchronous ReadFile that CancelIoEx
+        // usually can't interrupt, so close the pseudo console: the read
+        // then fails with BROKEN_PIPE once conhost exits.
+        if (self.subprocess.pty) |*pty| pty.closeConsole();
+
         // Interrupt the blocking read so the thread can see the quit message
         if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
             switch (windows.GetLastError()) {

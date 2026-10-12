@@ -757,10 +757,17 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.closeTabMode(
-                        value,
-                        core_surface.rt_surface,
-                    );
+                    const rt_surface = core_surface.rt_surface;
+                    // Closing this surface now would free it while its own
+                    // key handler is still on the stack (Ctrl+Shift+W), so
+                    // defer to the WM_CLOSE handler like Surface.close does.
+                    if (value == .this) {
+                        if (rt_surface.hwnd) |hwnd| {
+                            _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
+                            return true;
+                        }
+                    }
+                    rt_surface.parent_window.closeTabMode(value, rt_surface);
                 },
             }
             return true;

@@ -336,6 +336,9 @@ const WindowsPty = struct {
     out_pipe_pty: windows.HANDLE,
     in_pipe_pty: windows.HANDLE,
     pseudo_console: windows.HPCON,
+    /// Set by closeConsole once the pseudo console and our copies of its
+    /// pipe ends are closed.
+    console_closed: bool,
     size: winsize,
 
     pub const OpenError = error{Unexpected};
@@ -455,16 +458,39 @@ const WindowsPty = struct {
         );
         if (result != windows.S_OK) return error.Unexpected;
 
+        pty.console_closed = false;
         pty.size = size;
         return pty;
     }
 
-    pub fn deinit(self: *Pty) void {
-        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
-        _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
-        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
-        _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
+    /// Close the pseudo console and our copies of the pipe ends it uses,
+    /// leaving out_pipe open. Once conhost exits nothing holds the write
+    /// end of the output pipe any more, so a ReadFile blocked on out_pipe
+    /// fails with BROKEN_PIPE. CancelIoEx can't interrupt that synchronous
+    /// read, so this is how the read thread is unblocked on shutdown.
+    /// The read thread must still be draining out_pipe when this is called:
+    /// before Windows 11 24H2, ClosePseudoConsole waits for conhost to flush.
+    pub fn closeConsole(self: *Pty) void {
+        if (self.console_closed) return;
+        self.console_closed = true;
         _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
+        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
+    }
+
+    pub fn deinit(self: *Pty) void {
+        if (!self.console_closed) {
+            // Nobody is reading out_pipe any more, so close our ends first
+            // to keep ClosePseudoConsole from waiting on a flush.
+            _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
+            _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
+            _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
+            _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
+            _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        } else {
+            _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
+            _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
+        }
         self.* = undefined;
     }
 

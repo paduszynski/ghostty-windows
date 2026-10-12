@@ -535,6 +535,9 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     }
     self.selectTabIndex(self.active_tab);
     self.updateTabBarVisibility();
+    // Mouse closes get a repaint from hover tracking anyway; keyboard
+    // closes (close_tab) don't, which left the closed tab drawn.
+    self.invalidateTabBar();
 }
 
 /// Close tabs based on mode: this (current), other (all but current), right (all after current).
